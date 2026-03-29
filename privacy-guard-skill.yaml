@@ -1,0 +1,64 @@
+name: privacy-guard
+description: 检测、脱敏、恢复敏感信息（手机号、邮箱、身份证、银行卡、IP等）- 处理外部数据或用户输入时自动使用
+version: "1.0.0"
+
+trigger:
+  - "检查.*敏感"
+  - "脱敏"
+  - "隐藏.*信息"
+  - "redact"
+  - "privacy"
+  - "手机号|邮箱|身份证|银行卡"
+  - "发送给.*API"
+  - "处理.*用户.*输入"
+
+tools:
+  detect:
+    description: 检测文本中的敏感信息
+    parameters:
+      text:
+        type: string
+        description: 要扫描的文本
+    returns:
+      type: array
+      description: 检测到的敏感信息列表，包含类型、原始值、风险等级
+
+  redact:
+    description: 脱敏文本（用占位符替换敏感信息）
+    parameters:
+      text:
+        type: string
+        description: 要脱敏的文本
+      strategy:
+        type: string
+        description: "脱敏策略: placeholder(默认用[REDACTED_TYPE_N]), mask(部分遮罩), remove(完全删除)"
+        default: placeholder
+    returns:
+      type: object
+      description: 包含脱敏后文本和恢复映射的对象
+
+  restore:
+    description: 恢复脱敏文本
+    parameters:
+      text:
+        type: string
+        description: 已脱敏的文本
+      mapping:
+        type: object
+        description: 占位符到原始值的映射
+    returns:
+      type: string
+      description: 恢复后的原始文本
+
+usage: |
+  触发场景：
+  - 处理来自用户或外部的文本数据
+  - 发送数据到第三方 API 前
+  - 日志记录中包含敏感信息
+  - 数据库查询结果需要脱敏
+
+  工作流程：
+  1. detect - 先检查有哪些敏感信息
+  2. redact - 脱敏处理
+  3. [发送到外部/存储]
+  4. restore - 需要时用 mapping 恢复
