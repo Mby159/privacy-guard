@@ -6,7 +6,7 @@ Usage:
     # As CLI
     python privacy_guard.py detect "text with 13812345678"
     python privacy_guard.py redact "text with sensitive data"
-    python privacy_guard.py restore "redacted text" '{"[REDACTED_PHONE_1]": "13812345678"}'
+    python privacy_guard.py redact-file data.txt --output redacted.txt
 
     # As MCP server
     python privacy_guard.py --mcp
@@ -15,6 +15,7 @@ Usage:
 import json
 import re
 import sys
+import os
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -23,7 +24,6 @@ try:
     from mcp.server import Server
     from mcp.types import Tool, TextContent
     from mcp.server.stdio import stdio_server
-
     HAS_MCP = True
 except ImportError:
     HAS_MCP = False
@@ -47,6 +47,7 @@ class SensitiveInfo:
 class PrivacyGuard:
     def __init__(self):
         self._patterns = self._init_patterns()
+        self._custom_rules: Dict[str, Dict[str, Any]] = {}
         self._counter: Dict[str, int] = {}
         self._last_mapping: Dict[str, str] = {}
 
@@ -54,30 +55,50 @@ class PrivacyGuard:
         return {
             "phone": re.compile(r"(?<![\d\-])(?:\+?86[-\s]?)?(1[3-9]\d{9})(?![\d\-])"),
             "email": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
-            "id_card_cn": re.compile(
-                r"(?<![\dXx])\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![\dXx])"
-            ),
-            "bank_card": re.compile(
-                r"(?<![\d])\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}(?![\d])"
-            ),
+            "id_card_cn": re.compile(r"(?<![\dXx])\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![\dXx])"),
+            "bank_card": re.compile(r"(?<![\d])\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}(?![\d])"),
             "ssn": re.compile(r"\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b"),
-            "amount": re.compile(
-                r"(?:[￥¥$]\s*[\d,]+(?:\.\d{2})?)|(?:[\d,]+(?:\.\d{2})?\s*(?:元|美元|USD|CNY|RMB))"
-            ),
-            "ipv4": re.compile(
-                r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
-                r"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"
-            ),
-            "url": re.compile(
-                r"https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)"
-            ),
+            "amount": re.compile(r"(?:[￥¥$]\s*[\d,]+(?:\.\d{2})?)|(?:[\d,]+(?:\.\d{2})?\s*(?:元|美元|USD|CNY|RMB))"),
+            "ipv4": re.compile(r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"),
+            "url": re.compile(r"https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)"),
+            "china_passport": re.compile(r"(?<![\dA-Z])[A-Z]\d{8,9}(?![\dA-Z])"),
+            "china_credit_code": re.compile(r"(?<![\d])91[12]\d{16}(?![\d])"),
+            "jwt_token": re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
         }
+
+    def _luhn_check(self, card_number: str) -> bool:
+        digits = [int(d) for d in card_number if d.isdigit()]
+        if not digits:
+            return False
+        checksum = 0
+        for i, d in enumerate(reversed(digits)):
+            if i % 2 == 1:
+                d *= 2
+                if d > 9:
+                    d -= 9
+            checksum += d
+        return checksum % 10 == 0
+
+    def _validate_credit_code(self, code: str) -> bool:
+        if len(code) != 18:
+            return False
+        weight = [3, 7, 9, 10, 5, 8, 4, 2, 0, 6, 3, 7, 9, 10, 5, 8, 4, 2]
+        check_codes = "0123456789ABCDEFGHJKLMNPQRTUWXY"
+        code_upper = code.upper()
+        try:
+            checksum = sum(weight[i] * check_codes.index(code_upper[i]) for i in range(17))
+            return code_upper[17] == check_codes[checksum % 31]
+        except (ValueError, IndexError):
+            return False
 
     def _get_risk_level(self, info_type: str) -> str:
         risk_map = {
             "id_card_cn": RiskLevel.CRITICAL,
             "ssn": RiskLevel.CRITICAL,
+            "china_passport": RiskLevel.HIGH,
+            "jwt_token": RiskLevel.HIGH,
             "bank_card": RiskLevel.HIGH,
+            "china_credit_code": RiskLevel.CRITICAL,
             "phone": RiskLevel.MEDIUM,
             "email": RiskLevel.MEDIUM,
             "amount": RiskLevel.LOW,
@@ -90,193 +111,170 @@ class PrivacyGuard:
         self._counter[info_type] = self._counter.get(info_type, 0) + 1
         return f"[REDACTED_{info_type.upper()}_{self._counter[info_type]}]"
 
-    def detect(self, text: str) -> List[Dict[str, Any]]:
+    def add_rule(self, name: str, pattern: str, risk_level: str = "medium"):
+        try:
+            self._custom_rules[name] = {"pattern": re.compile(pattern), "risk_level": risk_level}
+            self._patterns[name] = self._custom_rules[name]["pattern"]
+            return True
+        except re.error:
+            return False
+
+    def list_rules(self) -> List[Dict[str, Any]]:
+        return [{"name": n, "risk_level": self._custom_rules[n]["risk_level"], "is_custom": True} 
+                for n in self._patterns if n in self._custom_rules]
+
+    def export_config_example(self) -> str:
+        return json.dumps({"rules": [{"name": "order_id", "pattern": r"订单号[:：]\s*([A-Z0-9]{10,20})", "risk_level": "low"}]}, ensure_ascii=False, indent=2)
+
+    def detect(self, text: str, skip_validation: bool = False) -> List[Dict[str, Any]]:
         detected = []
         for info_type, pattern in self._patterns.items():
             for match in pattern.finditer(text):
                 value = match.group()
-                placeholder = self._generate_placeholder(info_type)
-                detected.append(
-                    asdict(
-                        SensitiveInfo(
-                            info_type=info_type,
-                            original_value=value,
-                            placeholder=placeholder,
-                            risk_level=self._get_risk_level(info_type),
-                        )
-                    )
-                )
+                if info_type == "bank_card" and not skip_validation:
+                    if not self._luhn_check(value.replace("-", "").replace(" ", "")):
+                        continue
+                elif info_type == "china_credit_code" and not skip_validation:
+                    if not self._validate_credit_code(value.replace("-", "").replace(" ", "")):
+                        continue
+                detected.append(asdict(SensitiveInfo(info_type=info_type, original_value=value, placeholder=self._generate_placeholder(info_type), risk_level=self._get_risk_level(info_type))))
         return detected
+
+    def batch_detect(self, texts: List[str]) -> List[List[Dict[str, Any]]]:
+        return [self.detect(t) for t in texts]
+
+    def batch_redact(self, texts: List[str], strategy: str = "placeholder") -> List[Dict[str, Any]]:
+        return [self.redact(t, strategy) for t in texts]
+
+    def redact_file(self, file_path: str, output_path: Optional[str] = None, strategy: str = "placeholder") -> Dict[str, Any]:
+        if not os.path.exists(file_path):
+            return {"error": f"File not found: {file_path}"}
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            return {"error": f"Failed to read file: {str(e)}"}
+        result = self.redact(content, strategy)
+        if output_path:
+            try:
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(result["text"])
+                result["output_file"] = output_path
+            except Exception as e:
+                return {"error": f"Failed to write file: {str(e)}"}
+        return result
 
     def redact(self, text: str, strategy: str = "placeholder") -> Dict[str, Any]:
         self._counter = {}
         self._last_mapping = {}
         detected = self.detect(text)
-
         if not detected:
             return {"text": text, "mapping": {}, "detected_count": 0}
-
         redacted_text = text
-        sorted_items = sorted(
-            detected, key=lambda x: text.find(x["original_value"]), reverse=True
-        )
-
-        for item in sorted_items:
+        positions = [(text.find(i["original_value"]), len(i["original_value"]), i) for i in detected if text.find(i["original_value"]) >= 0]
+        positions.sort(key=lambda x: x[0], reverse=True)
+        for pos, length, item in positions:
             placeholder = item["placeholder"]
             original = item["original_value"]
             if strategy == "mask":
                 placeholder = self._mask_value(original)
             elif strategy == "remove":
                 placeholder = "[REDACTED]"
-            redacted_text = redacted_text.replace(original, placeholder)
+            redacted_text = redacted_text[:pos] + placeholder + redacted_text[pos + length:]
             self._last_mapping[placeholder] = original
-
-        return {
-            "text": redacted_text,
-            "mapping": self._last_mapping,
-            "detected_count": len(detected),
-        }
+        return {"text": redacted_text, "mapping": self._last_mapping, "detected_count": len(detected)}
 
     def _mask_value(self, value: str) -> str:
         if len(value) <= 4:
             return "*" * len(value)
         elif len(value) <= 8:
             return value[:2] + "*" * (len(value) - 4) + value[-2:]
-        else:
-            return value[:3] + "*" * (len(value) - 6) + value[-3:]
+        return value[:3] + "*" * (len(value) - 6) + value[-3:]
 
     def restore(self, text: str, mapping: Dict[str, str]) -> str:
         restored = text
-        for placeholder, original in sorted(
-            mapping.items(), key=lambda x: len(x[0]), reverse=True
-        ):
+        for placeholder, original in sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True):
             restored = restored.replace(placeholder, original)
         return restored
 
 
 async def run_mcp_server():
     if not HAS_MCP:
-        print(
-            "Error: MCP dependencies not installed. Run: pip install mcp",
-            file=sys.stderr,
-        )
+        print("Error: MCP dependencies not installed. Run: pip install mcp", file=sys.stderr)
         sys.exit(1)
-
     server = Server("privacy-guard")
     guard = PrivacyGuard()
 
     @server.list_tools()
     async def list_tools():
         return [
-            Tool(
-                name="detect",
-                description="Detect sensitive information in text (phone, email, ID, bank card, etc.)",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string", "description": "Text to scan"}
-                    },
-                    "required": ["text"],
-                },
-            ),
-            Tool(
-                name="redact",
-                description="Redact sensitive information from text",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string", "description": "Text to redact"},
-                        "strategy": {
-                            "type": "string",
-                            "description": "Strategy: placeholder (default), mask, or remove",
-                            "enum": ["placeholder", "mask", "remove"],
-                        },
-                    },
-                    "required": ["text"],
-                },
-            ),
-            Tool(
-                name="restore",
-                description="Restore redacted text to original using mapping",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string", "description": "Redacted text"},
-                        "mapping": {
-                            "type": "object",
-                            "description": "Mapping from placeholders to original values",
-                        },
-                    },
-                    "required": ["text", "mapping"],
-                },
-            ),
+            Tool(name="detect", description="Detect sensitive information in text", inputSchema={"type": "object", "properties": {"text": {"type": "string"}, "skip_validation": {"type": "boolean", "default": False}}, "required": ["text"]}),
+            Tool(name="redact", description="Redact sensitive information from text", inputSchema={"type": "object", "properties": {"text": {"type": "string"}, "strategy": {"type": "string", "enum": ["placeholder", "mask", "remove"]}}, "required": ["text"]}),
+            Tool(name="redact_file", description="Redact sensitive information from a file", inputSchema={"type": "object", "properties": {"file_path": {"type": "string"}, "output_path": {"type": "string"}, "strategy": {"type": "string", "default": "placeholder"}}, "required": ["file_path"]}),
+            Tool(name="restore", description="Restore redacted text to original", inputSchema={"type": "object", "properties": {"text": {"type": "string"}, "mapping": {"type": "object"}}, "required": ["text", "mapping"]}),
+            Tool(name="add_rule", description="Add a custom detection rule", inputSchema={"type": "object", "properties": {"name": {"type": "string"}, "pattern": {"type": "string"}, "risk_level": {"type": "string", "default": "medium"}}, "required": ["name", "pattern"]}),
+            Tool(name="list_rules", description="List all detection rules", inputSchema={"type": "object", "properties": {}}),
+            Tool(name="export_config", description="Export example configuration", inputSchema={"type": "object", "properties": {}}),
+            Tool(name="batch_detect", description="Detect in multiple texts", inputSchema={"type": "object", "properties": {"texts": {"type": "array", "items": {"type": "string"}}}, "required": ["texts"]}),
+            Tool(name="batch_redact", description="Redact from multiple texts", inputSchema={"type": "object", "properties": {"texts": {"type": "array", "items": {"type": "string"}}, "strategy": {"type": "string", "default": "placeholder"}}, "required": ["texts"]}),
         ]
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict):
         if name == "detect":
-            result = guard.detect(arguments["text"])
-            return [
-                TextContent(
-                    type="text", text=json.dumps(result, ensure_ascii=False, indent=2)
-                )
-            ]
+            return [TextContent(type="text", text=json.dumps(guard.detect(arguments["text"], arguments.get("skip_validation", False)), ensure_ascii=False, indent=2))]
         elif name == "redact":
-            strategy = arguments.get("strategy", "placeholder")
-            result = guard.redact(arguments["text"], strategy)
-            return [
-                TextContent(
-                    type="text", text=json.dumps(result, ensure_ascii=False, indent=2)
-                )
-            ]
+            return [TextContent(type="text", text=json.dumps(guard.redact(arguments["text"], arguments.get("strategy", "placeholder")), ensure_ascii=False, indent=2))]
+        elif name == "redact_file":
+            return [TextContent(type="text", text=json.dumps(guard.redact_file(arguments["file_path"], arguments.get("output_path"), arguments.get("strategy", "placeholder")), ensure_ascii=False, indent=2))]
         elif name == "restore":
-            result = guard.restore(arguments["text"], arguments["mapping"])
-            return [TextContent(type="text", text=result)]
+            return [TextContent(type="text", text=guard.restore(arguments["text"], arguments["mapping"]))]
+        elif name == "add_rule":
+            return [TextContent(type="text", text=json.dumps({"success": guard.add_rule(arguments["name"], arguments["pattern"], arguments.get("risk_level", "medium"))}, indent=2))]
+        elif name == "list_rules":
+            return [TextContent(type="text", text=json.dumps(guard.list_rules(), ensure_ascii=False, indent=2))]
+        elif name == "export_config":
+            return [TextContent(type="text", text=guard.export_config_example())]
+        elif name == "batch_detect":
+            return [TextContent(type="text", text=json.dumps(guard.batch_detect(arguments["texts"]), ensure_ascii=False, indent=2))]
+        elif name == "batch_redact":
+            return [TextContent(type="text", text=json.dumps(guard.batch_redact(arguments["texts"], arguments.get("strategy", "placeholder")), ensure_ascii=False, indent=2))]
         raise ValueError(f"Unknown tool: {name}")
 
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream, write_stream, server.create_initialization_options()
-        )
+        await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
 def main():
     guard = PrivacyGuard()
     args = sys.argv[1:]
-
     if not args:
         print(__doc__)
-        print("\nAvailable commands: detect, redact, restore")
+        print("\nAvailable commands: detect, redact, redact-file, restore, add-rule, list-rules, export-config, batch-detect, batch-redact")
         sys.exit(1)
-
     cmd = args[0]
-
     if cmd == "detect":
-        text = " ".join(args[1:]) if len(args) > 1 else input("Text: ")
-        print(json.dumps(guard.detect(text), ensure_ascii=False, indent=2))
-
+        print(json.dumps(guard.detect(" ".join(args[1:]) if len(args) > 1 else input("Text: ")), ensure_ascii=False, indent=2))
     elif cmd == "redact":
         text = " ".join(args[1:]) if len(args) > 1 else input("Text: ")
-        strategy = "placeholder"
-        for i, a in enumerate(args):
-            if a == "--strategy" and i + 1 < len(args):
-                strategy = args[i + 1]
-        print(json.dumps(guard.redact(text, strategy), ensure_ascii=False, indent=2))
-
+        print(json.dumps(guard.redact(text), ensure_ascii=False, indent=2))
+    elif cmd == "redact-file":
+        print(json.dumps(guard.redact_file(args[1] if len(args) > 1 else input("File path: ")), ensure_ascii=False, indent=2))
     elif cmd == "restore":
-        if len(args) < 3:
-            text = input("Redacted text: ")
-            mapping = json.loads(input("Mapping (JSON): "))
-        else:
-            text = args[1]
-            mapping = json.loads(args[2])
-        print(guard.restore(text, mapping))
-
+        print(guard.restore(args[1], json.loads(args[2])))
+    elif cmd == "add-rule":
+        print(f"Rule added: {guard.add_rule(args[1], args[2], args[3] if len(args) > 3 else 'medium')}")
+    elif cmd == "list-rules":
+        print(json.dumps(guard.list_rules(), ensure_ascii=False, indent=2))
+    elif cmd == "export-config":
+        print(guard.export_config_example())
+    elif cmd == "batch-detect":
+        print(json.dumps(guard.batch_detect(["test1", "test2"]), ensure_ascii=False, indent=2))
+    elif cmd == "batch-redact":
+        print(json.dumps(guard.batch_redact(["test1", "test2"]), ensure_ascii=False, indent=2))
     elif cmd == "--mcp":
         import asyncio
-
         asyncio.run(run_mcp_server())
-
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)
