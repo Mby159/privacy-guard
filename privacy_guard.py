@@ -179,9 +179,15 @@ class PrivacyGuard:
 
     def detect(self, text: str, skip_validation: bool = False) -> List[Dict[str, Any]]:
         detected = []
+        url_false_positives = [
+            "www.w3.org", "www.w3schools.com", "schemas.xmlsoap.org",
+            "xmlns.com", "purl.org", "dublincore.org"
+        ]
         for info_type, pattern in self._patterns.items():
             for match in pattern.finditer(text):
                 value = match.group()
+                if info_type == "url" and any(fp in value for fp in url_false_positives):
+                    continue
                 if info_type == "bank_card" and not skip_validation:
                     if not self._luhn_check(value.replace("-", "").replace(" ", "")):
                         continue
