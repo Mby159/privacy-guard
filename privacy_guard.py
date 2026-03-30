@@ -215,7 +215,7 @@ class PrivacyGuard:
                 return {"error": f"Failed to write file: {str(e)}"}
         return result
 
-    def scan_directory(self, directory: str, extensions: Optional[List[str]] = None, recursive: bool = True) -> Dict[str, Any]:
+    def scan_directory(self, directory: str, extensions: Optional[List[str]] = None, recursive: bool = True, exclude_git: bool = True) -> Dict[str, Any]:
         if not os.path.exists(directory):
             return {"error": f"Directory not found: {directory}"}
         if not os.path.isdir(directory):
@@ -226,6 +226,9 @@ class PrivacyGuard:
         if os.path.exists(ignore_file):
             with open(ignore_file, "r", encoding="utf-8") as f:
                 self._ignore_patterns = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        
+        default_ignores = [".git"] if exclude_git else []
+        self._ignore_patterns = default_ignores + self._ignore_patterns
         
         results = {"files": [], "total_files": 0, "total_findings": 0, "high_risk_files": []}
         
