@@ -1,40 +1,50 @@
-# File Brain MCP
+# Privacy Guard
 
-本地文件系统智能管理 - 搜索、索引、问答功能。
+敏感信息检测、脱敏、恢复工具。
 
 ## 功能
 
-- 关键词搜索
-- 向量搜索 (需要 numpy)
-- 中文分词 (需要 jieba)
-- 增量索引
-- AI 问答
+- 检测敏感信息
+- 脱敏处理 (placeholder/mask/remove)
+- 批量处理
+- 自定义规则
+
+## 支持的类型
+
+| 类型 | 风险等级 |
+|------|----------|
+| 手机号 | medium |
+| 邮箱 | medium |
+| 身份证 | critical |
+| 银行卡 | high |
+| 微信号 | high |
+| QQ号 | medium |
+| IP地址 | low |
 
 ## 安装
 
 ```bash
-pip install numpy jieba mcp
+pip install mcp
 ```
 
 ## 使用
 
 ```bash
-# 索引
-python file_brain_mcp.py index-dir ./docs/
+# 检测
+python privacy_guard.py detect "手机号13812345678"
 
-# 搜索
-python file_brain_mcp.py search "关键词"
-python file_brain_mcp.py vector-search "语义查询"
+# 脱敏
+python privacy_guard.py redact "手机号13812345678"
 
-# 问答
-python file_brain_mcp.py ask "问题"
+# 批量检测
+python privacy_guard.py batch-detect "text1,text2"
 
-# 增量索引
-python file_brain_mcp.py reindex ./docs/
+# 自定义规则
+python privacy_guard.py add-rule "订单号" "\d{10,}"
 ```
 
 ## MCP Server
 
 ```bash
-python file_brain_mcp.py --mcp
+python privacy_guard.py --mcp
 ```
